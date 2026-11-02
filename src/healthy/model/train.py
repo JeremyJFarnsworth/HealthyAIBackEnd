@@ -38,7 +38,11 @@ def load_dataset(dataset_path: str | Path) -> tuple[pd.DataFrame, pd.Series]:
     return X, y
 
 
-def train(dataset_path: str | Path, model_out_path: str | Path):
+def train(
+    dataset_path: str | Path,
+    model_out_path: str | Path,
+    test_dataset_path: str | Path | None = None,
+):
     """Train the diagnosis probability classifier and save the artifact.
 
     ``LogisticRegression`` with its default multinomial/softmax behavior for
@@ -48,13 +52,32 @@ def train(dataset_path: str | Path, model_out_path: str | Path):
     pipeline end-to-end. Swap in a neural classifier later (per the
     proposal's "deep learning classifier" language) if baseline accuracy
     turns out to be insufficient — the surrounding pipeline doesn't change.
+
+    If ``test_dataset_path`` is omitted, ``dataset_path`` is split 80/20
+    internally (unchanged default behavior). If given, ``dataset_path`` is
+    used whole as training data (e.g. ``dataset_v2.csv``, which already
+    excludes any held-out rows — see ``healthy.data.resample``), and the
+    held-out test set is instead reproduced from ``test_dataset_path`` via
+    the same stratified split, so a model trained on oversampled data is
+    always scored against real, untouched rows.
     """
     from sklearn.linear_model import LogisticRegression
 
     X, y = load_dataset(dataset_path)
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
+
+    if test_dataset_path is None:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+    else:
+        X_train, y_train = X, y
+        if "is_synthetic" in X_train.columns:
+            # Provenance flag, not a model feature (see healthy.data.resample).
+            X_train = X_train.drop(columns=["is_synthetic"])
+        X_eval, y_eval = load_dataset(test_dataset_path)
+        _, X_test, _, y_test = train_test_split(
+            X_eval, y_eval, test_size=0.2, random_state=42, stratify=y_eval
+        )
 
     model = LogisticRegression(max_iter=1000)
     model.fit(X_train, y_train)
@@ -79,8 +102,18 @@ def train(dataset_path: str | Path, model_out_path: str | Path):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print("Usage: python -m healthy.model.train <dataset_path> <model_out_path>")
+    args = sys.argv[1:]
+    test_dataset_path = None
+    if "--test-dataset" in args:
+        idx = args.index("--test-dataset")
+        test_dataset_path = args[idx + 1]
+        del args[idx : idx + 2]
+
+    if len(args) != 2:
+        print(
+            "Usage: python -m healthy.model.train <dataset_path> <model_out_path> "
+            "[--test-dataset <test_dataset_path>]"
+        )
         sys.exit(1)
 
-    train(sys.argv[1], sys.argv[2])
+    train(args[0], args[1], test_dataset_path=test_dataset_path)

@@ -80,6 +80,15 @@ can always be traced back to its exact training data. `data/` and `models/`
 are both git-ignored — raw or processed patient data must never be committed,
 even if it appears anonymized.
 
+`dataset_v2.csv` is the first version carrying an `is_synthetic` provenance
+column (`False`/`True`) — it is `dataset_v1.csv`'s training split with
+SMOTE-oversampled rows added for underperforming classes identified via
+`healthy.model.evaluate`'s per-class report (see `data/README.md` for full
+rationale and results). It contains no held-out test rows at all, so any
+model trained on it (`diagnosis_model_v2.pkl`, via `train()`'s
+`test_dataset_path` argument) must be evaluated against `dataset_v1.csv`'s
+real test split, never a split of `dataset_v2.csv` itself.
+
 ### Model baseline
 
 `healthy.model.train` uses `LogisticRegression` (multinomial/softmax) as a
