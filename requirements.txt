@@ -7,3 +7,5 @@ matplotlib
 pytest
 jupyter
 nbconvert
+openai
+pydantic

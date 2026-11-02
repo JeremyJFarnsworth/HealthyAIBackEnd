@@ -75,7 +75,7 @@ def clean(in_path: str | Path, out_path: str | Path) -> pd.DataFrame:
     return df
 
 
-def _vectorize_symptom_text(symptom_text: pd.Series, vocab: list[str]) -> pd.DataFrame:
+def vectorize_symptom_text(symptom_text: pd.Series, vocab: list[str]) -> pd.DataFrame:
     """Turn a ``"symptom one, symptom two, ..."`` column into binary flags.
 
     ``vocab`` entries use underscores (as in ``data.csv``'s headers);
@@ -109,7 +109,7 @@ def clean_diagnosis_dataset(
     df = pd.read_csv(symptom_csv_path)
     vocab = load_vocab(vocab_path)
 
-    features = _vectorize_symptom_text(df["symptom_text"], vocab)
+    features = vectorize_symptom_text(df["symptom_text"], vocab)
     out_df = pd.concat([df["diseases"].rename("disease"), features], axis=1)
     out_df = out_df.drop_duplicates()
 

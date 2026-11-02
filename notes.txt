@@ -1,0 +1,275 @@
+Week 3 Notes: Calibration (src/healthy/model/calibrate.py)
+============================================================
+
+WHAT WAS BUILT
+- Implemented all functions in calibrate.py (Requirement 3):
+  split_calibration_set, calibrate, top1_confidence_and_correctness,
+  compute_reliability_curve, compute_calibration_metrics,
+  plot_reliability_diagram, run_calibration.
+- split_calibration_set reproduces train.py's exact test split
+  (test_size=0.2, random_state=42, stratify=y) so pre/post-calibration
+  accuracy stays comparable, then carves a calibration set out of the
+  remainder (calib_size is a fraction of the ORIGINAL dataset).
+- calibrate() wraps the frozen baseline model (sklearn FrozenEstimator)
+  so CalibratedClassifierCV doesn't re-fit it per CV fold.
+- Added a third calibration method beyond isotonic/sigmoid:
+  "temperature" scaling (single global scalar on the logits before
+  softmax) via a custom _TemperatureScaledModel + _fit_temperature
+  (scipy.optimize.minimize_scalar, log-space search for T).
+- scipy added to requirements.txt (was only an indirect sklearn dep
+  before; calibrate.py now imports it directly).
+
+RESULTS ON dataset_v1.csv / diagnosis_model_v1.pkl
+  Method        Brier score   ECE
+  raw           0.0574        0.0244
+  isotonic      0.1453        0.1964   <- much worse
+  sigmoid       0.1599        0.2587   <- much worse
+  temperature   0.0569        0.0297   <- ~no-op, safe
+
+KEY FINDING: calibration made things WORSE, not better
+- The baseline LogisticRegression is already fairly well-calibrated
+  (85% accuracy vs ~83% mean confidence, raw ECE only 0.024).
+- CalibratedClassifierCV's isotonic/sigmoid methods fit 254 independent
+  one-vs-rest curves (one per disease), then renormalize across all
+  254 classes to sum to 1. That renormalization is what distorts top-1
+  confidence -- it's solving "is class X present, binary" per class,
+  not "is the top-1 guess right," which is the thing we actually
+  measure.
+- Confirmed this is NOT a dataset-size problem: tripled the
+  calibration set (129 -> 451 rows/class) and ECE barely moved
+  (0.196 -> 0.206 -> 0.210). A sample-size problem would have
+  improved with more data; this didn't -- it's a structural/bias
+  mismatch, not noise/variance.
+- Temperature scaling confirms the diagnosis: because it can only
+  rescale the whole probability vector by one global number (can
+  never change which class wins), it can't introduce the OvR
+  renormalization distortion. Result: landed within noise of raw
+  model on both metrics (slight Brier improvement, slight ECE
+  regression) -- "safe but ~unneeded," which is itself evidence the
+  model didn't have much real miscalibration to fix in the first
+  place. Fitted T ~= 0.57 (<1, i.e. slightly sharpened rather than
+  softened -- model was marginally underconfident at the margins,
+  not overconfident).
+
+TAKEAWAY FOR WRITE-UP
+- The pipeline (split -> calibrate -> measure -> plot) is correct and
+  produces a reproducible, measurable result per the acceptance
+  criterion -- it's just that the measurable result is "calibration
+  isn't needed here, and the wrong calibration method actively hurts."
+- Two methods (isotonic, sigmoid) measurably hurt; one (temperature)
+  is measurably safe/neutral. That contrast is stronger evidence for
+  "this data is already well-calibrated" than any single method's
+  result would be on its own.
+- Proposal commits to a "deep learning classifier"; current
+  recommendation is to KEEP LogisticRegression as the production
+  baseline -- 85% accuracy, well-calibrated already, data looks close
+  to linearly separable, so a heavier model isn't clearly justified
+  yet. This is a scope deviation worth explicitly calling out and
+  justifying (revisit if free-text/image inputs demand more capacity
+  later).
+
+RESOLVED (2026-10-27)
+- Decision: temperature scaling is now the ONLY calibration method in
+  calibrate.py. Removed CalibratedClassifierCV/FrozenEstimator (isotonic,
+  sigmoid) entirely -- calibrate() no longer takes a `method` arg, it's
+  always temperature scaling. This is a deliberate deviation from the
+  proposal's literal "Platt scaling or isotonic regression" wording,
+  justified by the measured results above (both hurt ECE 8-10x; temperature
+  was the only safe option). Documented in calibrate.py's module docstring.
+  No CLI changes were needed since there's only one method now.
+- Re-ran end-to-end after the change: raw ECE 0.0244 / Brier 0.0574,
+  calibrated (temperature) ECE 0.0297 / Brier 0.0569 -- matches prior
+  numbers, confirms the simplification didn't change behavior.
+- Still no automated tests for calibrate.py (matches existing convention --
+  train.py has none either).
+
+OPEN / NOT YET DONE
+- Write-up should call out explicitly: Requirement 3 as literally worded
+  ("Platt scaling or isotonic regression") is not what's implemented;
+  temperature scaling was substituted with evidence-backed justification.
+  Worth a short paragraph + the Brier/ECE table in the capstone report.
+
+
+Week 4 Notes: LLM Reasoning Layer (src/healthy/llm/)
+============================================================
+
+WHAT WAS BUILT
+Implemented Requirement 4 (LLM Reasoning Layer): a physician submits a
+free-text case description and gets back the same structured
+{diagnosis, score} output as Requirement 2, extended with LLM-authored
+description/treatment/tests -- never a free-form response. Runs against a
+local LLM served by LM Studio's OpenAI-compatible API (the user's model:
+Qwen2.5-Instruct).
+
+Sequencing decision: built this BEFORE the frontend, following the
+proposal's own Week 4 (LLM) -> Week 6-7 (frontend) order, rather than
+building the UI first. Reasoning: the frontend's result cards/detail view
+are just a client for whatever JSON shape this layer produces, so locking
+that contract first avoids reworking the UI once the real API shape was
+known.
+
+New package: src/healthy/llm/
+  __init__.py   - empty, marks the package.
+
+  schemas.py    - Pydantic models defining every structured-output contract
+                  in this layer, so a malformed LLM response raises
+                  ValidationError instead of silently passing through as
+                  prose:
+                    - ExtractedSymptoms {symptoms: list[str]}
+                      -- output of the first LLM call (text -> symptoms).
+                    - LLMDiagnosisDetail {diagnosis, description,
+                      common_symptoms, treatment_plan, suggested_tests}
+                      -- output of the second LLM call, PER candidate
+                      diagnosis. Deliberately has NO score field -- the
+                      probability must come from the calibrated classifier,
+                      never from the LLM, so there's no field for the LLM to
+                      invent or override it.
+                    - LLMDiagnosisDetails {details: list[LLMDiagnosisDetail]}
+                      -- wrapper for the second call's full JSON response.
+                    - DiagnosisDetail {diagnosis, score, description,
+                      common_symptoms, treatment_plan, suggested_tests}
+                      -- the FINAL merged shape (classifier score + LLM
+                      detail) returned to the caller.
+                    - DiagnosisResponse {results: list[DiagnosisDetail]}
+                      -- the top-level response envelope.
+
+  client.py     - Thin wrapper around the `openai` Python SDK pointed at a
+                  local LM Studio server (LM Studio speaks the OpenAI
+                  chat-completions API, so no bespoke HTTP client was
+                  needed). Two things it owns:
+                    - Reads LLM_BASE_URL and LLM_MODEL from environment
+                      variables -- no safe default port, because LM Studio
+                      picks a fresh port per launch unless pinned in its
+                      settings (seen this session: 56285, not the 1234
+                      default). LLM_MODEL must be the exact model id shown
+                      in LM Studio's server tab, not a display name.
+                    - chat_completion_json(system_prompt, user_prompt,
+                      schema): calls the chat endpoint with
+                      response_format={"type": "json_schema", ...} built
+                      from the given Pydantic model's
+                      .model_json_schema(), constraining the model's output
+                      at generation time. If the response still isn't valid
+                      JSON (local models sometimes wrap output in prose or
+                      markdown fences even when schema-constrained), it
+                      retries ONCE with an explicit "JSON only" follow-up
+                      message before raising JSONDecodeError.
+
+  extract.py    - extract_symptoms(case_text, vocab) -> list[str]. The first
+                  LLM call: turns a free-text narrative into a list of
+                  symptoms drawn from the same 377-entry vocabulary the
+                  classifier was trained on (healthy.data.vocab). Prompts
+                  the LLM with the full vocab list (space-separated display
+                  form) and asks it to return only symptoms explicitly
+                  supported by the text. Critically, the LLM is NOT trusted
+                  to stay within the given list -- any returned term that
+                  isn't an exact match against vocab is silently dropped
+                  server-side (mirrors how MultiLabelBinarizer already
+                  silently drops unknown symptom labels elsewhere in the
+                  pipeline, e.g. clean.py's vectorizer).
+
+  reasoning.py  - diagnose_from_text(case_text, top_n=5, model_path,
+                  vocab_path) -> dict. The orchestrator tying everything
+                  together:
+                    1. load_vocab() + extract_symptoms() -> canonical
+                       symptom list for this case.
+                    2. Joins those symptoms into vocab's comma-joined
+                       display-text form and feeds it through
+                       healthy.data.clean.vectorize_symptom_text() (the
+                       SAME vectorizer train.py's dataset was built with)
+                       to get the 377-wide binary feature row.
+                    3. Loads the CALIBRATED model
+                       (models/diagnosis_model_v1.calibrated.pkl) via
+                       joblib and calls .predict_proba() on the feature
+                       row; takes the top-N (diagnosis, score) pairs sorted
+                       by probability. This is the ONLY source of truth for
+                       scores in the final output.
+                    4. Second LLM call: given the case text plus the top-N
+                       diagnosis/score candidates, asks the LLM to fill in
+                       description/common_symptoms/treatment_plan/
+                       suggested_tests for EACH candidate (LLMDiagnosisDetails
+                       schema). Validated via Pydantic before use.
+                    5. Merges LLM detail with classifier scores by diagnosis
+                       name (any candidate the LLM didn't return detail for
+                       is silently skipped rather than included
+                       half-populated) and returns a DiagnosisResponse,
+                       serialized via .model_dump().
+                  Also has a `python -m healthy.llm.reasoning "<case text>"`
+                  CLI entry point (mirrors train.py's __main__ pattern) that
+                  prints the final JSON to stdout -- this is the manual,
+                  real-LM-Studio end-to-end smoke test, separate from the
+                  mocked unit tests.
+
+CHANGES TO EXISTING FILES
+- src/healthy/data/clean.py: renamed the private _vectorize_symptom_text to
+  public vectorize_symptom_text (and updated its one existing caller,
+  clean_diagnosis_dataset) so reasoning.py could import it directly instead
+  of reaching into a private function. No behavior change.
+- tests/test_clean.py: updated import/call sites for the rename.
+- requirements.txt: added `openai` (SDK, works against any OpenAI-compatible
+  server including LM Studio) and `pydantic` (structured-output validation).
+
+TESTS (tests/test_llm.py)
+All mocked -- no network call, no LM Studio server required to run these:
+  - test_extract_symptoms_filters_hallucinated_terms: mocks
+    chat_completion_json to return a symptom the model invented outside the
+    vocab, asserts it gets dropped.
+  - test_diagnose_from_text_assembles_response_with_classifier_scores: mocks
+    load_vocab, extract_symptoms, joblib.load (stub classifier with fixed
+    predict_proba/classes_), and chat_completion_json's second call; asserts
+    the final response's scores come from the stub classifier untouched and
+    LLM-authored fields are merged in correctly, in classifier-ranked order.
+  - test_malformed_llm_response_raises_validation_error: a DiagnosisDetail
+    missing required fields raises pydantic.ValidationError rather than
+    silently passing through.
+Full suite: 6 passed (includes the pre-existing test_clean.py tests,
+confirming the vectorize_symptom_text rename didn't break anything).
+
+HOW TO RUN AGAINST THE REAL LOCAL LLM
+1. Start the server in LM Studio (Developer/server tab), note the exact
+   base URL it prints (port is NOT guaranteed to be 1234) and the exact
+   model identifier loaded (Qwen2.5-Instruct in this setup).
+2. Set env vars to match, e.g.:
+     set LLM_BASE_URL=http://127.0.0.1:56285/v1
+     set LLM_MODEL=qwen2.5-7b-instruct
+3. python -m healthy.llm.reasoning "<some free-text case description>"
+   -- confirm valid JSON output (no free prose), response within ~15s
+   (Requirement 4's time budget), and that nothing failed in extraction or
+   schema validation.
+
+BUG FOUND + FIXED DURING MANUAL TESTING (2026-10-27)
+- models/diagnosis_model_v1.calibrated.pkl failed to load from reasoning.py
+  with: AttributeError: Can't get attribute '_TemperatureScaledModel' on
+  <module 'healthy.llm.reasoning' ...>
+- Root cause: the pickle had originally been produced by running
+  `python -m healthy.model.calibrate ...`. Running a module via `-m` makes
+  Python set that module's __name__ to "__main__", so any class defined at
+  module scope in it (here, _TemperatureScaledModel) gets pickled with
+  __module__ == "__main__" instead of "healthy.model.calibrate". Unpickling
+  then only works from whatever script happens to be __main__ at load time
+  -- it broke the moment a different entry point (reasoning.py) tried to
+  load it.
+- Fix: regenerated the pickle by calling run_calibration(...) through a
+  normal import (`python -c "from healthy.model.calibrate import
+  run_calibration; run_calibration(...)"`) instead of `-m`, so the class is
+  pickled with its real module path. Re-ran and confirmed identical metrics
+  (raw ECE 0.0244 / Brier 0.0574, calibrated ECE 0.0297 / Brier 0.0569) --
+  pure pickle-portability fix, no behavior change.
+- Takeaway: avoid running calibrate.py (or any module that defines a class
+  meant to be pickled) via `python -m` when the resulting artifact needs to
+  be loaded elsewhere. If calibrate.py is ever re-run standalone again (per
+  its own `Usage:` docstring), re-save the artifact via a plain import
+  afterward, or move _TemperatureScaledModel's definition before considering
+  `-m` safe again.
+
+OPEN / NOT YET DONE
+- No automated test exercises the real LM Studio server end-to-end (by
+  design -- unit tests are mocked); only the manual CLI run above does that.
+- Disease-name mismatch risk: the classifier's taxonomy (254 classes from
+  final_symptoms_to_disease.csv) is NOT guaranteed to overlap with
+  text_cases_v1.csv's Symptom2Disease-based labels, so text_cases_v1.csv is
+  only useful here as a free-text smoke-test fixture, not for measuring
+  accuracy against its `disease` column.
+- No API/HTTP layer yet (FastAPI/Flask) -- diagnose_from_text() is a plain
+  Python function today; wiring it behind an endpoint is later work, likely
+  alongside Requirement 5 (text-based case input UI) once frontend work
+  starts.
