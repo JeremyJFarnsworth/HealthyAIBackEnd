@@ -8,6 +8,9 @@ __pycache__/
 # Environment
 .env
 
+# Local SQLite dev database
+*.db
+
 # Data (never commit patient data)
 data/raw/*
 !data/raw/.gitkeep

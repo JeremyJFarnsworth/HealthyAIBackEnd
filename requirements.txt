@@ -10,3 +10,12 @@ jupyter
 nbconvert
 openai
 pydantic
+fastapi
+uvicorn[standard]
+sqlalchemy
+psycopg2-binary
+passlib[bcrypt]
+bcrypt==4.0.1
+python-jose[cryptography]
+python-multipart
+pydantic-settings

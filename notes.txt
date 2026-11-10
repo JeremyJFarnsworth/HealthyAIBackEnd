@@ -273,3 +273,85 @@ OPEN / NOT YET DONE
   Python function today; wiring it behind an endpoint is later work, likely
   alongside Requirement 5 (text-based case input UI) once frontend work
   starts.
+
+
+Week 5 Notes: Per-Class Profiling, SMOTE Oversampling, and Recalibration
+============================================================
+
+WHAT WAS BUILT
+- src/healthy/model/evaluate.py: per_class_report(model, X_test, y_test) --
+  precision/recall/f1/support/top-5 hit rate per disease class, reproducing
+  train.py's exact held-out split (test_size=0.2, random_state=42,
+  stratify=y) so results are scored against the same test rows train.py
+  already evaluated. weak_classes() filters the report down to a target
+  list by a recall threshold.
+- src/healthy/data/resample.py: oversample_weak_classes() applies SMOTE
+  (imbalanced-learn, added to requirements.txt) restricted to a given list
+  of target classes only -- never touches well-represented classes.
+  build_resampled_dataset() reproduces the same 80/20 split on
+  dataset_v1.csv, discards the test 20% entirely, and oversamples only
+  within the training 80%, writing dataset_v2.csv (disease + 377 symptom
+  flags + a new `is_synthetic` column: False = real row, True =
+  SMOTE-interpolated). dataset_v2.csv therefore contains NO held-out test
+  rows at all -- evaluation always goes back to dataset_v1.csv's test
+  split.
+- train.py gained an optional `test_dataset_path` arg: when given,
+  `dataset_path` is used whole as training data (is_synthetic dropped
+  before fitting, it's a provenance flag not a feature) and the held-out
+  test set is reproduced from `test_dataset_path` instead.
+
+WHY: a per-class profile of diagnosis_model_v1.pkl showed recall was NOT
+correlated with class size (support vs. recall correlation ~= -0.11; the
+30 classes below 0.7 recall actually averaged MORE test rows than the
+overall mean) -- ruling out "just not enough rows" as the explanation and
+motivating a targeted-oversampling experiment instead of blindly adding
+more data.
+
+RESULTS: dataset_v2.csv / diagnosis_model_v2.pkl vs. dataset_v1.csv / diagnosis_model_v1.pkl
+- Targeted the 30 classes with recall < 0.7 under v1. dataset_v2.csv:
+  130,981 real training rows + 1,367 SMOTE-synthetic rows.
+- Weak-class average recall: 0.59 -> 0.65.
+- Overall accuracy: 0.850 -> 0.851 (flat -- no regression).
+- Non-targeted ("strong") class average recall: 0.892 -> 0.890 (flat --
+  no collateral damage from oversampling).
+- Roughly half the targeted classes improved substantially (uterine
+  fibroids +31pp, ileus +29pp, diabetic retinopathy +27pp, glaucoma +22pp,
+  acne +21pp); the other half barely moved or regressed slightly (corneal
+  disorder -5pp, psychotic disorder -2pp, depression -2pp, skin polyp
+  ~flat) -- mostly psychiatric and dermatologic diagnoses.
+
+KEY FINDING: SMOTE helps classes that were weak due to real sampling
+noise, but can't fix classes that are weak because they look
+near-identical to another disease in the current 377-symptom binary
+vocabulary -- more interpolated rows of the same features don't add new
+distinguishing information. That's a feature-overlap ceiling, not a
+data-volume problem, for the half of the weak classes that didn't
+improve. Closing that gap would need genuinely new, independently-sourced
+symptom data (see the deferred DDXPlus discussion from this same
+planning session) rather than further resampling of what's already here.
+
+RECALIBRATION: diagnosis_model_v2.calibrated.pkl (2026-11-02)
+- Ran diagnosis_model_v2.pkl through the existing temperature-scaling
+  calibration (healthy.model.calibrate.run_calibration), using
+  dataset_v1.csv (the real data, not dataset_v2.csv) as the input so the
+  test split matches evaluate.py's and the feature columns match what the
+  model expects (no is_synthetic column).
+- Invoked via a plain import (`from healthy.model.calibrate import
+  run_calibration; run_calibration(...)`), NOT `python -m`, per the
+  pickle-portability bug documented above -- confirmed the resulting
+  pickle's class is `healthy.model.calibrate._TemperatureScaledModel`,
+  not `__main__`.
+- Result: raw Brier 0.0577 / ECE 0.0238, calibrated Brier 0.0575 /
+  ECE 0.0298 -- matches v1's calibration result almost exactly (v1: raw
+  0.0574/0.0244, calibrated 0.0569/0.0297). As expected: the model was
+  already well-calibrated before SMOTE, and SMOTE changed which classes
+  it gets right without changing its overall confidence behavior, so
+  temperature scaling is still ~a no-op here.
+
+OPEN / NOT YET DONE
+- DDXPlus dataset mapping (49 diseases / 110 symptom codes onto the
+  existing 254-class / 377-symptom schema) remains deliberately deferred --
+  it needs a human-curated crosswalk, not something to auto-generate, and
+  is the most likely next step for the classes SMOTE couldn't fix.
+- Per-class evaluation/resampling only run with one random_state (42) and
+  one recall threshold (0.7); not yet checked for sensitivity to either.
